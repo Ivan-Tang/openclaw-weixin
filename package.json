@@ -45,9 +45,6 @@
     "extensions": [
       "./index.ts"
     ],
-    "runtimeExtensions": [
-      "./dist/index.js"
-    ],
     "channel": {
       "id": "openclaw-weixin",
       "label": "openclaw-weixin",
