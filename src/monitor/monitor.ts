@@ -14,6 +14,8 @@ const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
 const BACKOFF_DELAY_MS = 30_000;
 const RETRY_DELAY_MS = 2_000;
+/** Cap concurrently running inbound turns (backlog storm after a long offline window). */
+const MAX_CONCURRENT_PROCESSING = 8;
 
 export type MonitorWeixinOpts = {
   baseUrl: string;
@@ -37,7 +39,10 @@ export type MonitorWeixinOpts = {
 
 /**
  * Long-poll loop: getUpdates -> normalize -> recordInboundSession -> dispatchReplyFromConfig.
- * Runs until abort.
+ * Each inbound turn is dispatched detached (bounded by MAX_CONCURRENT_PROCESSING)
+ * so polling keeps running while the agent works — this is what lets the gateway
+ * steer mid-run messages into the active session, and what keeps hot-reload stops
+ * inside the 5s budget. Runs until abort.
  */
 export async function monitorWeixinProvider(opts: MonitorWeixinOpts): Promise<void> {
   const {
@@ -85,6 +90,29 @@ export async function monitorWeixinProvider(opts: MonitorWeixinOpts): Promise<vo
 
   let nextTimeoutMs = longPollTimeoutMs ?? DEFAULT_LONG_POLL_TIMEOUT_MS;
   let consecutiveFailures = 0;
+
+  /** Currently running (detached) inbound turns. */
+  let activeTurns = 0;
+  const turnWaiters: Array<() => void> = [];
+
+  const waitForTurnSlot = (signal?: AbortSignal): Promise<void> =>
+    new Promise((resolve) => {
+      if (signal?.aborted) {
+        resolve();
+        return;
+      }
+      const notify = () => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      };
+      const onAbort = () => {
+        const i = turnWaiters.indexOf(notify);
+        if (i !== -1) turnWaiters.splice(i, 1);
+        resolve();
+      };
+      turnWaiters.push(notify);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
 
   while (!abortSignal?.aborted) {
     try {
@@ -173,7 +201,32 @@ export async function monitorWeixinProvider(opts: MonitorWeixinOpts): Promise<vo
         const fromUserId = full.from_user_id ?? "";
         const cachedConfig = await configManager.getForUser(fromUserId, full.context_token);
 
-        const processP = processOneMessage(full, {
+        // Backpressure: when too many turns are already running, wait for a
+        // slot but stay interruptible by abort.
+        if (activeTurns >= MAX_CONCURRENT_PROCESSING) {
+          await waitForTurnSlot(abortSignal);
+          if (abortSignal?.aborted) {
+            aLog.info(`abort while waiting for a free processing slot; exiting`);
+            return;
+          }
+        }
+
+        // Run the turn detached so getUpdates resumes immediately:
+        //  1) Steering — while an agent turn is active, new WeChat messages
+        //     keep arriving and the gateway injects them into the active run
+        //     (messages.queue mode "steer" is the host default; per-session
+        //     order and single-active-run are guaranteed by the host lane
+        //     queue, not by this loop). Blocking here would pin the poll and
+        //     leave inbound messages stranded server-side until the turn ends.
+        //  2) Hot reload — an abort exits the monitor at once while running
+        //     turns finish in the background (outbound is channel-independent,
+        //     so the user still gets their reply). The old inline await blew
+        //     the gateway's 5s stop budget and the account never restarted.
+        activeTurns += 1;
+        aLog.info(
+          `dispatching inbound turn in background: from=${fromUserId || "unknown"} activeTurns=${activeTurns}`,
+        );
+        void processOneMessage(full, {
           accountId,
           config,
           channelRuntime,
@@ -183,27 +236,14 @@ export async function monitorWeixinProvider(opts: MonitorWeixinOpts): Promise<vo
           typingTicket: cachedConfig.typingTicket,
           log: opts.runtime?.log ?? (() => {}),
           errLog,
-        });
-
-        if (abortSignal) {
-          // processOneMessage runs the agent turn and can take minutes. Without
-          // racing, a config hot-reload abort could not stop the monitor within
-          // the gateway's 5s budget, and the account was then never restarted.
-          // On abort, detach: let the turn finish in the background (the user
-          // still gets the reply via the channel's independent outbound) and
-          // exit the monitor immediately.
-          const outcome = await Promise.race([
-            processP.then(() => "done" as const),
-            waitForAbort(abortSignal),
-          ]);
-          if (outcome === "aborted") {
-            processP.catch((err) => aLog.error(`detached processOneMessage failed: ${String(err)}`));
-            aLog.info(`abort during processOneMessage; run detached, monitor exiting`);
-            return;
-          }
-        } else {
-          await processP;
-        }
+        })
+          .catch((err) => {
+            aLog.error(`background processOneMessage failed: ${String(err)}`);
+          })
+          .finally(() => {
+            activeTurns -= 1;
+            for (const notify of turnWaiters.splice(0)) notify();
+          });
       }
     } catch (err) {
       if (abortSignal?.aborted) {
@@ -224,23 +264,15 @@ export async function monitorWeixinProvider(opts: MonitorWeixinOpts): Promise<vo
           `getUpdates: ${MAX_CONSECUTIVE_FAILURES} consecutive failures, backing off 30s`,
         );
         consecutiveFailures = 0;
-        await sleep(30_000, abortSignal);
+        // Abort during backoff should end the monitor cleanly (the while
+        // condition exits next), not reject with "aborted".
+        await sleep(30_000, abortSignal).catch(() => {});
       } else {
-        await sleep(2000, abortSignal);
+        await sleep(2000, abortSignal).catch(() => {});
       }
     }
   }
   aLog.info(`Monitor ended`);
-}
-
-function waitForAbort(signal: AbortSignal): Promise<"aborted"> {
-  return new Promise((resolve) => {
-    if (signal.aborted) {
-      resolve("aborted");
-      return;
-    }
-    signal.addEventListener("abort", () => resolve("aborted"), { once: true });
-  });
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
