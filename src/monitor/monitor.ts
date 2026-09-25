@@ -155,7 +155,11 @@ export async function monitorWeixinProvider(opts: MonitorWeixinOpts): Promise<vo
         aLog.debug(`Saved new get_updates_buf (${getUpdatesBuf.length} bytes)`);
       }
       const list = resp.msgs ?? [];
-      for (const full of list) {
+      for (const [idx, full] of list.entries()) {
+        if (abortSignal?.aborted) {
+          aLog.info(`abort before message ${idx + 1}/${list.length}; exiting (buf already advanced)`);
+          return;
+        }
         aLog.info(
           `inbound message: from=${full.from_user_id} types=${full.item_list?.map((i) => i.type).join(",") ?? "none"}`,
         );
@@ -169,7 +173,7 @@ export async function monitorWeixinProvider(opts: MonitorWeixinOpts): Promise<vo
         const fromUserId = full.from_user_id ?? "";
         const cachedConfig = await configManager.getForUser(fromUserId, full.context_token);
 
-        await processOneMessage(full, {
+        const processP = processOneMessage(full, {
           accountId,
           config,
           channelRuntime,
@@ -180,6 +184,26 @@ export async function monitorWeixinProvider(opts: MonitorWeixinOpts): Promise<vo
           log: opts.runtime?.log ?? (() => {}),
           errLog,
         });
+
+        if (abortSignal) {
+          // processOneMessage runs the agent turn and can take minutes. Without
+          // racing, a config hot-reload abort could not stop the monitor within
+          // the gateway's 5s budget, and the account was then never restarted.
+          // On abort, detach: let the turn finish in the background (the user
+          // still gets the reply via the channel's independent outbound) and
+          // exit the monitor immediately.
+          const outcome = await Promise.race([
+            processP.then(() => "done" as const),
+            waitForAbort(abortSignal),
+          ]);
+          if (outcome === "aborted") {
+            processP.catch((err) => aLog.error(`detached processOneMessage failed: ${String(err)}`));
+            aLog.info(`abort during processOneMessage; run detached, monitor exiting`);
+            return;
+          }
+        } else {
+          await processP;
+        }
       }
     } catch (err) {
       if (abortSignal?.aborted) {
@@ -207,6 +231,16 @@ export async function monitorWeixinProvider(opts: MonitorWeixinOpts): Promise<vo
     }
   }
   aLog.info(`Monitor ended`);
+}
+
+function waitForAbort(signal: AbortSignal): Promise<"aborted"> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve("aborted");
+      return;
+    }
+    signal.addEventListener("abort", () => resolve("aborted"), { once: true });
+  });
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
